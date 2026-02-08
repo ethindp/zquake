@@ -37,10 +37,10 @@ typedef struct
 } hunk_t;
 
 byte	*hunk_base;
-int		hunk_size;
+int64_t		hunk_size;
 
-int		hunk_low_used;
-int		hunk_high_used;
+int64_t		hunk_low_used;
+int64_t		hunk_high_used;
 
 qbool	hunk_tempactive;
 int		hunk_tempmark;
@@ -673,7 +673,7 @@ void *Cache_Alloc (cache_user_t *c, int size, char *name)
 Memory_Init
 ========================
 */
-void Memory_Init (void *buf, int size)
+void Memory_Init (void *buf, int64_t size)
 {
 	hunk_base = buf;
 	hunk_size = size;

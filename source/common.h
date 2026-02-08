@@ -28,6 +28,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "net.h"
 #include "protocol.h"
 #include "cmodel.h"
+#include <stdint.h>
 
 
 //
@@ -292,13 +293,13 @@ extern double	curtime;	// not bounded or scaled, shared by
 // host
 //
 extern qbool	host_initialized;
-extern int		host_memsize;
+extern int64_t		host_memsize;
 
 extern cvar_t	host_mapname;
 
 // functions that may be called accross subsystems (host, client, server)
 
-void Host_Init (int argc, char **argv, int default_memsize);
+void Host_Init (int argc, char **argv, int64_t default_memsize);
 void Host_ClearMemory ();
 void Host_Shutdown (void);
 void Host_Frame (double time);

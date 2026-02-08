@@ -150,6 +150,7 @@ float	FloatSwap (float f);
 #endif
 
 int	Q_atoi (char *str);
+int	Q_atoi64 (char *str);
 float Q_atof (char *str);
 char *Q_ftos (float value);		// removes trailing zero chars
 

@@ -685,24 +685,20 @@ char *PR_GetString(int num)
 	return pr_strings + num;
 }
 
-int PR_SetString(char *s)
-{
-	int i;
-
-	if (s - pr_strings < 0) {
-		for (i = 0; i <= num_prstr; i++)
-			if (pr_strtbl[i] == s)
-				break;
-		if (i < num_prstr)
-			return -i;
-		if (num_prstr == MAX_PRSTR - 1)
-			Sys_Error("MAX_PRSTR");
-		num_prstr++;
-		pr_strtbl[num_prstr] = s;
-//Com_DPrintf ("SET:%d == %s\n", -num_prstr, s);
-		return -num_prstr;
-	}
-	return (int)(s - pr_strings);
+int PR_SetString(char *s) {
+    int i;
+    ptrdiff_t offset = s - pr_strings;
+    if (offset >= 0 && offset < progs->numstrings) {
+        return (int)offset;
+    }
+    for (i = 1; i <= num_prstr; i++)
+        if (pr_strtbl[i] == s)
+            return -i;
+    if (num_prstr == MAX_PRSTR - 1)
+        Sys_Error("MAX_PRSTR");
+    num_prstr++;
+    pr_strtbl[num_prstr] = s;
+    return -num_prstr;
 }
 
 // reset static string counter and init dynamic strings array

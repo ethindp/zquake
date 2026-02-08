@@ -22,7 +22,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "pmove.h"
 #include "version.h"
 #include <setjmp.h>
-
+#include <stdint.h>
 
 #if !defined(CLIENTONLY) && !defined(SERVERONLY)
 qbool		dedicated = false;
@@ -34,7 +34,7 @@ double		curtime;
 
 qbool		host_initialized;		// true if into command execution
 int			host_hunklevel;
-int			host_memsize;
+int64_t			host_memsize;
 void		*host_membase;
 
 jmp_buf 	host_abort;
@@ -134,18 +134,18 @@ Host_InitMemory
 memsize is the recommended amount of memory to use for hunk
 ===============
 */
-void Host_InitMemory (int memsize)
+void Host_InitMemory (int64_t memsize)
 {
-	int		t;
+	int64_t		t;
 
 	if (COM_CheckParm ("-minmemory"))
 		memsize = MINIMUM_MEMORY;
 
 	if ((t = COM_CheckParm ("-heapsize")) != 0 && t + 1 < com_argc)
-		memsize = Q_atoi (com_argv[t + 1]) * 1024;
+		memsize = Q_atoi64 (com_argv[t + 1]) * 1024;
 
 	if ((t = COM_CheckParm ("-mem")) != 0 && t + 1 < com_argc)
-		memsize = Q_atoi (com_argv[t + 1]) * 1024 * 1024;
+		memsize = Q_atoi64 (com_argv[t + 1]) * 1024 * 1024;
 
 	if (memsize < MINIMUM_MEMORY)
 		Sys_Error ("Only %4.1f megs of memory reported, can't execute game", memsize / (float)0x100000);
@@ -209,7 +209,7 @@ void Host_Frame (double time)
 Host_Init
 ====================
 */
-void Host_Init (int argc, char **argv, int default_memsize)
+void Host_Init (int argc, char **argv, int64_t default_memsize)
 {
 	COM_InitArgv (argc, argv);
 

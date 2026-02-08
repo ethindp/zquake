@@ -31,9 +31,10 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include <limits.h>
 #include <direct.h>		// _mkdir
 #endif
+#include <stdint.h>
 
 #define MINIMUM_WIN_MEMORY	0x0c00000
-#define MAXIMUM_WIN_MEMORY	0x1000000
+#define MAXIMUM_WIN_MEMORY	0x100000000
 
 #define PAUSE_SLEEP		50				// sleep time on pause or minimization
 #define NOT_FOCUS_SLEEP	20				// sleep time when not focus
@@ -522,9 +523,9 @@ HWND		hwnd_dialog;	// startup dialog box
 
 int WINAPI WinMain (HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
-	int				memsize;
+	int64_t				memsize;
 	double			time, oldtime, newtime;
-	MEMORYSTATUS	lpBuffer;
+	MEMORYSTATUSEX lpBuffer;
 	RECT			rect;
 
 	global_hInstance = hInstance;
@@ -573,17 +574,13 @@ int WINAPI WinMain (HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLin
 // take the greater of all the available memory or half the total memory,
 // but at least 8 Mb and no more than 16 Mb, unless they explicitly
 // request otherwise
-	lpBuffer.dwLength = sizeof(MEMORYSTATUS);
-	GlobalMemoryStatus (&lpBuffer);
-
-	memsize = lpBuffer.dwAvailPhys;
-
+	lpBuffer.dwLength = sizeof(MEMORYSTATUSEX);
+	GlobalMemoryStatusEx (&lpBuffer);
+	memsize = lpBuffer.ullAvailPhys;
 	if (memsize < MINIMUM_WIN_MEMORY)
 		memsize = MINIMUM_WIN_MEMORY;
-
-	if (memsize < (lpBuffer.dwTotalPhys >> 1))
-		memsize = lpBuffer.dwTotalPhys >> 1;
-
+	if (memsize < (lpBuffer.ullTotalPhys >> 1))
+		memsize = lpBuffer.ullTotalPhys >> 1;
 	if (memsize > MAXIMUM_WIN_MEMORY)
 		memsize = MAXIMUM_WIN_MEMORY;
 
@@ -639,12 +636,14 @@ int main (int argc, char **argv)
 {
 	double			newtime, time, oldtime;
 	int				sleep_msec;
-
+MEMORYSTATUSEX mstatus;
+mstatus.dwLength = sizeof(MEMORYSTATUSEX);
+GlobalMemoryStatusEx(&mstatus);
 	SetConsoleCtrlHandler (HandlerRoutine, TRUE);
 	hinput = GetStdHandle (STD_INPUT_HANDLE);
 	houtput = GetStdHandle (STD_OUTPUT_HANDLE);
 
-	Host_Init (argc, argv, 16*1024*1024);
+	Host_Init (argc, argv, mstatus.ullAvailPhys / 10);
 
 //
 // main loop

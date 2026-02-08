@@ -78,10 +78,7 @@ set(ZQUAKE_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/source/rc_image.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/source/rc_wad.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/source/skin.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/source/snd_dma.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/source/snd_mem.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/source/snd_mix.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/source/snd_win.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/source/snd_fmod.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/source/sv_authlists.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/source/sv_bot.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/source/sv_ccmds.c"
@@ -156,10 +153,7 @@ set(ZQUAKE_VIDNULL_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/source/rc_image.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/source/rc_wad.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/source/skin.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/source/snd_dma.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/source/snd_mem.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/source/snd_mix.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/source/snd_win.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/source/snd_fmod.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/source/sv_authlists.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/source/sv_bot.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/source/sv_ccmds.c"
@@ -226,15 +220,18 @@ else()
   set(ZQDS_LIBS wsock32 winmm)
 endif()
 add_executable(zquake WIN32 ${ZQUAKE_SOURCES})
+set_property(TARGET zquake PROPERTY OUTPUT_NAME zquake-gl)
 target_include_directories(zquake PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/source")
 target_link_libraries(zquake PRIVATE ${ZQUAKE_LIBS} FMOD::FMOD)
 target_compile_definitions(zquake PRIVATE AGRIP MAUTH GLQUAKE _WINDOWS)
 add_executable(zquake_vidnull WIN32 ${ZQUAKE_VIDNULL_SOURCES})
+set_property(TARGET zquake_vidnull PROPERTY OUTPUT_NAME zquake-vidnull)
 target_include_directories(zquake_vidnull
                            PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/source")
 target_link_libraries(zquake_vidnull PRIVATE ${ZQUAKE_LIBS} FMOD::FMOD)
 target_compile_definitions(zquake_vidnull PRIVATE AGRIP MAUTH VIDNULL _WINDOWS)
 add_executable(zqds ${ZQDS_SOURCES})
+set_property(TARGET zqds PROPERTY OUTPUT_NAME zqds)
 target_include_directories(zqds PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/source")
 target_link_libraries(zqds PRIVATE ${ZQDS_LIBS})
 target_compile_definitions(zqds PRIVATE AGRIP MAUTH SERVERONLY _CONSOLE)

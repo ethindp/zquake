@@ -19,6 +19,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 */
 #ifndef _ZONE_H_
 #define _ZONE_H_
+#include <stdint.h>
 
 /*
  memory allocation
@@ -80,7 +81,7 @@ startup hunk allocations
 
 */
 
-void Memory_Init (void *buf, int size);
+void Memory_Init (void *buf, int64_t size);
 
 void *Hunk_Alloc (int size);		// returns 0 filled memory
 void *Hunk_AllocName (int size, char *name);

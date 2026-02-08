@@ -20,6 +20,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 // q_shared.c -- functions shared by all subsystems
 
 #include "q_shared.h"
+#include <stdint.h>
 
 /*
 ============================================================================
@@ -85,6 +86,62 @@ int Q_atoi (char *str)
 	return 0;
 }
 
+
+int Q_atoi64 (char *str)
+{
+	int64_t		val;
+	int		sign;
+	int		c;
+
+	if (*str == '-')
+	{
+		sign = -1;
+		str++;
+	}
+	else
+		sign = 1;
+	
+	val = 0;
+
+//
+// check for hex
+//
+	if (str[0] == '0' && (str[1] == 'x' || str[1] == 'X') )
+	{
+		str += 2;
+		while (1)
+		{
+			c = (int)(unsigned char)*str++;
+			if ( isdigit(c) )
+				val = (val<<4) + c - '0';
+			else if ( isxdigit(c) )
+				val = (val<<4) + tolower(c) - 'a' + 10;
+			else
+				return val*sign;
+		}
+	}
+
+//
+// check for character
+//
+	if (str[0] == '\'')
+	{
+		return sign * str[1];
+	}
+
+//
+// assume decimal
+//
+	while (1)
+	{
+		c = (int)(unsigned char)*str++;
+		if ( !isdigit(c) )
+			return val*sign;
+		val = val*10 + c - '0';
+	}
+
+	return 0;
+}
 
 float Q_atof (char *str)
 {
