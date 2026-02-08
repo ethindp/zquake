@@ -55,7 +55,6 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #define QU_PER_METER 39.37f
 #define STATIC_ATTEN_DIV 64.0f
 #define MIN_3D_DIST 80.0f
-#define MAX_SFX (MAX_SOUNDS * 2)
 #define MAX_FMOD_CHANNELS 4095
 #define NOMINAL_CLIP_DIST 1000.0f
 #ifndef ATMOKY_PLUGIN_FILENAME
@@ -64,6 +63,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #define VALID_ENTITY(n) ((n) > 0 && (n) < MAX_EDICTS)
 #define MAX_SOUND_VELOCITY_QU 3000.0f
 #define TELEPORT_DIST_QU 1000.0f
+#define SFX_INITIAL 256
+#define SFX_GROW 256
 
 enum atmokySpatializerParameterIndex {
   ATMOKY_PARAMETER_MIN_DISTANCE,       // float
@@ -102,6 +103,12 @@ enum AtmokyOutputFormat {
   ATMOKY_OUTPUT_FORMAT_MAX = ATMOKY_OUTPUT_FORMAT_SEVEN_POINT_ONE_POINT_FOUR
 };
 
+enum atmokyExternalizerParameterIndex {
+  ATMOKY_EXTERNALIZER_AMOUNT,    // float [0..100], default 50
+  ATMOKY_EXTERNALIZER_CHARACTER, // float [0..100], default 50
+  ATMOKY_EXTERNALIZER_NUM_PARAMETERS,
+};
+
 static FMOD_SYSTEM *fmod_system = NULL;
 static qbool fmod_initialized = false;
 static qbool snd_commands_initialized = false;
@@ -119,9 +126,10 @@ typedef struct {
   qbool loaded; // true = load was attempted (sound may be NULL on failure)
 } fmod_sfx_t;
 
-static sfx_t known_sfx[MAX_SFX];
-static fmod_sfx_t fmod_sounds[MAX_SFX];
-static int num_sfx;
+static sfx_t *known_sfx = NULL;
+static fmod_sfx_t *fmod_sounds = NULL;
+static int max_sfx = 0;
+static int num_sfx = 0;
 static sfx_t *ambient_sfx[NUM_AMBIENTS];
 
 typedef struct {
@@ -167,6 +175,10 @@ cvar_t s_mixahead = {"s_mixahead", "0.1", CVAR_ARCHIVE};
 cvar_t s_swapstereo = {"s_swapstereo", "0", CVAR_ARCHIVE};
 cvar_t s_doppler = {"s_doppler", "1", CVAR_ARCHIVE};
 cvar_t s_doppler_factor = {"s_doppler_factor", "1.0", CVAR_ARCHIVE};
+cvar_t s_externalizer = {"s_externalizer", "1", CVAR_ARCHIVE};
+cvar_t s_externalizer_amount = {"s_externalizer_amount", "50", CVAR_ARCHIVE};
+cvar_t s_externalizer_character = {"s_externalizer_character", "50",
+                                   CVAR_ARCHIVE};
 
 static void S_Play_f(void);
 static void S_PlayVol_f(void);
@@ -187,10 +199,10 @@ typedef struct {
 static const output_entry_t output_types[] = {
     {"auto", FMOD_OUTPUTTYPE_AUTODETECT},
     {"nosound", FMOD_OUTPUTTYPE_NOSOUND},
-    {"wavwriter", FMOD_OUTPUTTYPE_WAVWRITER},
 #ifdef _WIN32
     {"wasapi", FMOD_OUTPUTTYPE_WASAPI},
     {"asio", FMOD_OUTPUTTYPE_ASIO},
+    {"winsonic", FMOD_OUTPUTTYPE_WINSONIC},
 #endif
 #ifdef __linux__
     {"pulseaudio", FMOD_OUTPUTTYPE_PULSEAUDIO},
@@ -207,6 +219,50 @@ static const char *OutputTypeName(FMOD_OUTPUTTYPE type) {
     if (output_types[i].type == type)
       return output_types[i].name;
   return "unknown";
+}
+
+static qbool GrowSfxArrays(void) {
+  if ((uint64_t)(max_sfx + SFX_GROW) >= INT_MAX)
+    Sys_Error("Grow SFX: exceeded maximum integer width");
+  int32_t new_cap = max_sfx + SFX_GROW;
+  sfx_t *new_known;
+  fmod_sfx_t *new_fmod;
+  new_known = (sfx_t *)Q_malloc(new_cap * sizeof(sfx_t));
+  new_fmod = (fmod_sfx_t *)Q_malloc(new_cap * sizeof(fmod_sfx_t));
+  if (!new_known || !new_fmod) {
+    if (new_known)
+      Q_free(new_known);
+    if (new_fmod)
+      Q_free(new_fmod);
+    Com_Printf("GrowSfxArrays: Q_malloc failed for %d slots\n", new_cap);
+    return false;
+  }
+  if (known_sfx && max_sfx > 0) {
+    memcpy(new_known, known_sfx, max_sfx * sizeof(sfx_t));
+    memcpy(new_fmod, fmod_sounds, max_sfx * sizeof(fmod_sfx_t));
+  }
+  memset(&new_known[max_sfx], 0, SFX_GROW * sizeof(sfx_t));
+  memset(&new_fmod[max_sfx], 0, SFX_GROW * sizeof(fmod_sfx_t));
+  for (int i = 0; i < NUM_AMBIENTS; i++) {
+    if (ambient_sfx[i]) {
+      int idx = (int)(ambient_sfx[i] - known_sfx);
+      ambient_sfx[i] = &new_known[idx];
+    }
+  }
+  for (int i = 0; i < MAX_FMOD_CHANNELS; i++) {
+    if (fmod_channels[i].sfx) {
+      int idx = (int)(fmod_channels[i].sfx - known_sfx);
+      fmod_channels[i].sfx = &new_known[idx];
+    }
+  }
+  if (known_sfx)
+    Q_free(known_sfx);
+  if (fmod_sounds)
+    Q_free(fmod_sounds);
+  known_sfx = new_known;
+  fmod_sounds = new_fmod;
+  max_sfx = new_cap;
+  return true;
 }
 
 static FMOD_VECTOR QVec(vec3_t v) {
@@ -422,6 +478,91 @@ static void Atmoky_AttachSpatializer(fmod_channel_t *fch, FMOD_CHANNEL *channel,
   }
 }
 
+static void Atmoky_AttachExternalizer(void) {
+  FMOD_RESULT result;
+  FMOD_CHANNELGROUP *master = NULL;
+  if (!atmoky_available || !atmoky_externalizer_handle || !fmod_system)
+    return;
+  if (!s_externalizer.value)
+    return;
+  if (atmoky_master_externalizer)
+    return;
+  result = FMOD_System_CreateDSPByPlugin(
+      fmod_system, atmoky_externalizer_handle, &atmoky_master_externalizer);
+  if (result != FMOD_OK || !atmoky_master_externalizer) {
+    Com_Printf("Atmoky: CreateDSPByPlugin (Externalizer) failed: %s\n",
+               FMOD_ErrorString(result));
+    atmoky_master_externalizer = NULL;
+    return;
+  }
+  result = FMOD_System_GetMasterChannelGroup(fmod_system, &master);
+  if (result != FMOD_OK || !master) {
+    Com_Printf("Atmoky: GetMasterChannelGroup failed: %s\n",
+               FMOD_ErrorString(result));
+    FMOD_DSP_Release(atmoky_master_externalizer);
+    atmoky_master_externalizer = NULL;
+    return;
+  }
+  result = FMOD_ChannelGroup_AddDSP(master, FMOD_CHANNELCONTROL_DSP_TAIL,
+                                    atmoky_master_externalizer);
+  if (result != FMOD_OK) {
+    Com_Printf("Atmoky: ChannelGroup_AddDSP (Externalizer) failed: %s\n",
+               FMOD_ErrorString(result));
+    FMOD_DSP_Release(atmoky_master_externalizer);
+    atmoky_master_externalizer = NULL;
+    return;
+  }
+  result = FMOD_DSP_SetParameterFloat(atmoky_master_externalizer,
+                                      ATMOKY_EXTERNALIZER_AMOUNT,
+                                      s_externalizer_amount.value);
+  FMOD_ERRLOG(result, "Externalizer set amount");
+  result = FMOD_DSP_SetParameterFloat(atmoky_master_externalizer,
+                                      ATMOKY_EXTERNALIZER_CHARACTER,
+                                      s_externalizer_character.value);
+  FMOD_ERRLOG(result, "Externalizer set character");
+  Com_Printf("Atmoky: Externalizer attached to master bus (amount=%.0f, "
+             "character=%.0f)\n",
+             s_externalizer_amount.value, s_externalizer_character.value);
+}
+
+static void Atmoky_DetachExternalizer(void) {
+  FMOD_CHANNELGROUP *master = NULL;
+  if (!atmoky_master_externalizer)
+    return;
+  if (fmod_system) {
+    if (FMOD_System_GetMasterChannelGroup(fmod_system, &master) == FMOD_OK &&
+        master) {
+      FMOD_ChannelGroup_RemoveDSP(master, atmoky_master_externalizer);
+    }
+  }
+  FMOD_DSP_Release(atmoky_master_externalizer);
+  atmoky_master_externalizer = NULL;
+  Com_Printf("Atmoky: Externalizer detached\n");
+}
+
+static void Atmoky_UpdateExternalizer(void) {
+  FMOD_RESULT result;
+  if (!s_externalizer.value && atmoky_master_externalizer) {
+    Atmoky_DetachExternalizer();
+    return;
+  }
+  if (s_externalizer.value && !atmoky_master_externalizer) {
+    Atmoky_AttachExternalizer();
+    if (!atmoky_master_externalizer)
+      return;
+  }
+  if (!atmoky_master_externalizer)
+    return;
+  result = FMOD_DSP_SetParameterFloat(atmoky_master_externalizer,
+                                      ATMOKY_EXTERNALIZER_AMOUNT,
+                                      s_externalizer_amount.value);
+  FMOD_ERRLOG(result, "Externalizer update amount");
+  result = FMOD_DSP_SetParameterFloat(atmoky_master_externalizer,
+                                      ATMOKY_EXTERNALIZER_CHARACTER,
+                                      s_externalizer_character.value);
+  FMOD_ERRLOG(result, "Externalizer update character");
+}
+
 static qbool ChannelIsPlaying(FMOD_CHANNEL *ch) {
   FMOD_BOOL playing = 0;
   if (!ch)
@@ -433,7 +574,7 @@ static qbool ChannelIsPlaying(FMOD_CHANNEL *ch) {
 
 static int SfxIndex(sfx_t *sfx) {
   int idx = (int)(sfx - known_sfx);
-  if (idx < 0 || idx >= MAX_SFX)
+  if (idx < 0 || idx >= max_sfx)
     return -1;
   return idx;
 }
@@ -521,10 +662,11 @@ static void S_UpdateMovingSounds(void) {
       continue;
     if (fch->entnum == cl.playernum + 1)
       continue;
-FMOD_MODE ch_mode;
-result = FMOD_Channel_GetMode(fch->channel, &ch_mode);
-FMOD_ERRCHECK(result, "Retrieval of sound mode");
-if (!(ch_mode & FMOD_3D)) continue;
+    FMOD_MODE ch_mode;
+    result = FMOD_Channel_GetMode(fch->channel, &ch_mode);
+    FMOD_ERRCHECK(result, "Retrieval of sound mode");
+    if (!(ch_mode & FMOD_3D))
+      continue;
     vec3_t ent_origin;
     VectorCopy(cl_entities[fch->entnum].lerp_origin, ent_origin);
     VectorAdd(ent_origin, fch->origin_offset, cur_origin);
@@ -557,18 +699,34 @@ if (!(ch_mode & FMOD_3D)) continue;
   }
 }
 
+static qbool ChannelIsVirtual(FMOD_CHANNEL *ch) {
+  FMOD_BOOL virt = 0;
+  if (!ch)
+    return false;
+  if (FMOD_Channel_IsVirtual(ch, &virt) != FMOD_OK)
+    return false;
+  return virt ? true : false;
+}
+
 sfx_t *S_FindName(char *name) {
   int i;
   sfx_t *sfx;
+
   if (!name)
     Sys_Error("S_FindName: NULL");
   if (strlen(name) >= MAX_QPATH)
     Sys_Error("Sound name too long: %s", name);
+
   for (i = 0; i < num_sfx; i++)
     if (!strcmp(known_sfx[i].name, name))
       return &known_sfx[i];
-  if (num_sfx == MAX_SFX)
-    Sys_Error("S_FindName: out of sfx_t");
+
+  /* need a new slot */
+  if (num_sfx >= max_sfx) {
+    if (!GrowSfxArrays())
+      Sys_Error("S_FindName: couldn't grow sfx arrays");
+  }
+
   sfx = &known_sfx[num_sfx];
   strcpy(sfx->name, name);
   memset(&sfx->cache, 0, sizeof(sfx->cache));
@@ -697,7 +855,6 @@ Find a free slot, or steal the oldest non-player channel.
 */
 static fmod_channel_t *AllocChannel(void) {
   int i;
-
   for (i = 0; i < MAX_FMOD_CHANNELS; i++) {
     if (!fmod_channels[i].channel)
       return &fmod_channels[i];
@@ -707,29 +864,15 @@ static fmod_channel_t *AllocChannel(void) {
       return &fmod_channels[i];
     }
   }
-  {
-    int best = -1;
-    float best_dist_sq = -1.0f;
-    for (i = 0; i < MAX_FMOD_CHANNELS; i++) {
-      vec3_t delta;
-      float dist_sq;
-      if (fmod_channels[i].entnum == cl.playernum + 1)
-        continue;
-      if (fmod_channels[i].is_static)
-        continue;
-      VectorSubtract(fmod_channels[i].origin_qu, listener_origin, delta);
-      dist_sq = DotProduct(delta, delta);
-      if (dist_sq > best_dist_sq) {
-        best_dist_sq = dist_sq;
-        best = i;
-      }
-    }
-    if (best >= 0) {
-      FMOD_Channel_Stop(fmod_channels[best].channel);
-      Atmoky_ReleaseSpatializer(&fmod_channels[best]);
-      memset(&fmod_channels[best], 0, sizeof(fmod_channels[best]));
-      return &fmod_channels[best];
-    }
+  for (i = 0; i < MAX_FMOD_CHANNELS; i++) {
+    if (!fmod_channels[i].channel)
+      continue;
+    if (!ChannelIsVirtual(fmod_channels[i].channel))
+      continue;
+    FMOD_Channel_Stop(fmod_channels[i].channel);
+    Atmoky_ReleaseSpatializer(&fmod_channels[i]);
+    memset(&fmod_channels[i], 0, sizeof(fmod_channels[i]));
+    return &fmod_channels[i];
   }
   return NULL;
 }
@@ -852,6 +995,9 @@ void S_Init(void) {
     Cvar_Register(&s_swapstereo);
     Cvar_Register(&s_doppler);
     Cvar_Register(&s_doppler_factor);
+    Cvar_Register(&s_externalizer);
+    Cvar_Register(&s_externalizer_amount);
+    Cvar_Register(&s_externalizer_character);
     Cmd_AddLegacyCommand("volume", "s_volume");
     Cmd_AddLegacyCommand("nosound", "s_nosound");
     Cmd_AddLegacyCommand("precache", "s_precache");
@@ -902,6 +1048,7 @@ void S_Init(void) {
     fmod_system = NULL;
     return;
   }
+
   result = FMOD_System_Set3DSettings(
       fmod_system, s_doppler.value ? s_doppler_factor.value : 0.0f,
       atmoky_available ? 1.0f : QU_PER_METER, 1.0f);
@@ -910,6 +1057,16 @@ void S_Init(void) {
   dma.channels = 2;
   dma.samplebits = 16;
   dma.speed = 44100;
+  if (!known_sfx) {
+    known_sfx = (sfx_t *)Q_malloc(SFX_INITIAL * sizeof(sfx_t));
+    fmod_sounds = (fmod_sfx_t *)Q_malloc(SFX_INITIAL * sizeof(fmod_sfx_t));
+    if (!known_sfx || !fmod_sounds)
+      Sys_Error("S_Init: couldn't allocate sfx arrays");
+    memset(known_sfx, 0, SFX_INITIAL * sizeof(sfx_t));
+    memset(fmod_sounds, 0, SFX_INITIAL * sizeof(fmod_sfx_t));
+    max_sfx = SFX_INITIAL;
+    num_sfx = 0;
+  }
   fmod_initialized = true;
   snd_initialized = true;
   {
@@ -929,6 +1086,7 @@ void S_Init(void) {
     Com_Printf("  Doppler: %s (factor %.2f)\n", s_doppler.value ? "on" : "off",
                s_doppler_factor.value);
   }
+  Atmoky_AttachExternalizer();
   ambient_sfx[AMBIENT_WATER] = S_PrecacheSound("ambience/water1.wav");
   ambient_sfx[AMBIENT_SKY] = S_PrecacheSound("ambience/wind2.wav");
   S_StopAllSounds(true);
@@ -960,8 +1118,7 @@ void S_Shutdown(void) {
     fmod_sounds[i].loaded = false;
   }
   if (atmoky_master_externalizer) {
-    FMOD_DSP_Release(atmoky_master_externalizer);
-    atmoky_master_externalizer = NULL;
+    Atmoky_DetachExternalizer();
   }
   if (atmoky_root_handle) {
     FMOD_System_UnloadPlugin(fmod_system, atmoky_root_handle);
@@ -975,6 +1132,16 @@ void S_Shutdown(void) {
     FMOD_System_Release(fmod_system);
     fmod_system = NULL;
   }
+  if (known_sfx) {
+    Q_free(known_sfx);
+    known_sfx = NULL;
+  }
+  if (fmod_sounds) {
+    Q_free(fmod_sounds);
+    fmod_sounds = NULL;
+  }
+  max_sfx = 0;
+  num_sfx = 0;
   fmod_initialized = false;
   snd_initialized = false;
   Com_Printf("FMOD sound system shut down\n");
@@ -986,12 +1153,7 @@ S_Restart
 ================
 */
 void S_Restart(void) {
-  int i;
   S_Shutdown();
-  for (i = 0; i < num_sfx; i++) {
-    fmod_sounds[i].sound = NULL;
-    fmod_sounds[i].loaded = false;
-  }
   S_Init();
 }
 
@@ -1267,6 +1429,7 @@ void S_Update(vec3_t origin, vec3_t forward, vec3_t right, vec3_t up) {
   S_UpdateMovingSounds(); /* <--- ADD THIS */
   if (atmoky_available) {
     Atmoky_UpdateSpatializers();
+    Atmoky_UpdateExternalizer();
   }
   if (s_show.value) {
     int nplaying = 0;
@@ -1469,7 +1632,7 @@ static void S_SoundInfo_f(void) {
     Com_Printf("FMOD sound system not initialized\n");
     return;
   }
-  Com_Printf("--- FMOD Sound Info ---\n");
+  Com_Printf("FMOD Sound Info:\n");
   result = FMOD_System_GetVersion(fmod_system, &version, &buildnumber);
   if (result == FMOD_OK)
     Com_Printf("  Version      : %08x, build %d\n", version, buildnumber);
@@ -1495,7 +1658,15 @@ static void S_SoundInfo_f(void) {
   Com_Printf("  Volume       : %.2f\n", s_volume.value);
   Com_Printf("  Doppler      : %s (factor %.2f)\n",
              s_doppler.value ? "on" : "off", s_doppler_factor.value);
-  Com_Printf("  Sounds loaded: %d / %d\n", num_sfx, MAX_SFX);
+  Com_Printf(" Sounds loaded: %d / %d\n", num_sfx, max_sfx);
+  if (atmoky_available) {
+    Com_Printf("  Atmoky: spatializer %s, externalizer %s\n",
+               atmoky_spatializer_handle ? "OK" : "missing",
+               atmoky_master_externalizer ? "active" : "off");
+    if (atmoky_master_externalizer)
+      Com_Printf("              amount=%.0f, character=%.0f\n",
+                 s_externalizer_amount.value, s_externalizer_character.value);
+  }
 }
 
 /*
