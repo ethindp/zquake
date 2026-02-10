@@ -123,7 +123,8 @@ static FMOD_VECTOR listener_atmoky_right;
 
 typedef struct {
   FMOD_SOUND *sound;
-  qbool loaded; // true = load was attempted (sound may be NULL on failure)
+  qbool loaded;
+  qbool want_precache;
 } fmod_sfx_t;
 
 static sfx_t *known_sfx = NULL;
@@ -708,6 +709,20 @@ static qbool ChannelIsVirtual(FMOD_CHANNEL *ch) {
   return virt ? true : false;
 }
 
+static void FMOD_ProcessQueuedPrecaches(void) {
+  if (!fmod_initialized || !fmod_system)
+    return;
+  if (!s_precache.value)
+    return;
+  for (int i = 0; i < num_sfx; i++) {
+    if (!fmod_sounds[i].want_precache)
+      continue;
+    if (fmod_sounds[i].loaded)
+      continue; // already attempted
+    FMOD_LoadSfx(&known_sfx[i]);
+  }
+}
+
 sfx_t *S_FindName(char *name) {
   int i;
   sfx_t *sfx;
@@ -799,11 +814,16 @@ S_PrecacheSound
 */
 sfx_t *S_PrecacheSound(char *name) {
   sfx_t *sfx;
-  if (!fmod_initialized || s_nosound.value)
+  if (s_nosound.value)
     return NULL;
   sfx = S_FindName(name);
-  if (s_precache.value)
+  int idx = SfxIndex(sfx);
+  if (idx >= 0) {
+    fmod_sounds[idx].want_precache = true;
+  }
+  if (fmod_initialized && s_precache.value) {
     FMOD_LoadSfx(sfx);
+  }
   return sfx;
 }
 
@@ -813,9 +833,12 @@ S_TouchSound
 ================
 */
 void S_TouchSound(char *name) {
-  if (!fmod_initialized)
+  if (!name || s_nosound.value)
     return;
-  S_FindName(name);
+  sfx_t *sfx = S_FindName(name);
+  int idx = SfxIndex(sfx);
+  if (idx >= 0)
+    fmod_sounds[idx].want_precache = true;
 }
 
 /*
@@ -1048,7 +1071,6 @@ void S_Init(void) {
     fmod_system = NULL;
     return;
   }
-
   result = FMOD_System_Set3DSettings(
       fmod_system, s_doppler.value ? s_doppler_factor.value : 0.0f,
       atmoky_available ? 1.0f : QU_PER_METER, 1.0f);
@@ -1069,6 +1091,7 @@ void S_Init(void) {
   }
   fmod_initialized = true;
   snd_initialized = true;
+  FMOD_ProcessQueuedPrecaches();
   {
     FMOD_OUTPUTTYPE actual;
     int ndrivers;
@@ -1418,7 +1441,7 @@ void S_Update(vec3_t origin, vec3_t forward, vec3_t right, vec3_t up) {
   FMOD_ERRLOG(result, "Set3DListenerAttributes");
   result = FMOD_System_Set3DSettings(
       fmod_system, s_doppler.value ? s_doppler_factor.value : 0.0f,
-      QU_PER_METER, 1.0f);
+      atmoky_available ? 1.0f : QU_PER_METER, 1.0f);
   FMOD_ERRLOG(result, "Set3DSettings");
   result = FMOD_System_GetMasterChannelGroup(fmod_system, &master);
   if (result == FMOD_OK && master) {
@@ -1680,7 +1703,6 @@ static void S_FMOD_Output_f(void) {
   const char *arg;
   qbool found = false;
   int i;
-
   if (Cmd_Argc() < 2) {
     Com_Printf("Current FMOD output: %s\n", OutputTypeName(desired_output));
     Com_Printf("Usage: s_fmod_output <type>\n");
@@ -1706,17 +1728,7 @@ static void S_FMOD_Output_f(void) {
     return;
   }
   Com_Printf("FMOD output set to '%s'...\n", arg);
-
-  // TODO: Implement the actual restart here once you've verified
-  // everything works.  The sequence is:
-  //
-  //   1. desired_output is already set above.
-  //   2. S_Restart() calls S_Shutdown() then S_Init().
-  //   3. S_Init() calls FMOD_System_SetOutput(desired_output)
-  //      after FMOD_System_Create() but before FMOD_System_Init().
-  //
-  // Uncomment when ready:
-  // S_Restart();
+  S_Restart();
 }
 
 /*
@@ -1760,9 +1772,15 @@ static void S_FMOD_Restart_f(void) {
   S_Restart();
 }
 
-void S_ClearPrecache(void) {}
-void S_BeginPrecaching(void) {}
-void S_EndPrecaching(void) {}
+void S_ClearPrecache(void) {
+  for (int i = 0; i < num_sfx; i++)
+    fmod_sounds[i].want_precache = false;
+}
+
+void S_BeginPrecaching(void) { S_ClearPrecache(); }
+
+void S_EndPrecaching(void) { FMOD_ProcessQueuedPrecaches(); }
+
 void S_PaintChannels(int endtime) {}
 void SND_InitScaletable(void) {}
 channel_t *SND_PickChannel(int entnum, int entchannel) { return NULL; }
