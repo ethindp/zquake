@@ -19,6 +19,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "quakedef.h"
 #include "sound.h"
+#include "pmove.h"
 #include <fmod.h>
 #include <fmod_dsp.h>
 #include <fmod_errors.h>
@@ -65,6 +66,9 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #define TELEPORT_DIST_QU 1000.0f
 #define SFX_INITIAL 256
 #define SFX_GROW 256
+#define OCCLUSION_RAY_COUNT 8
+#define OCCLUSION_MAX_DIST 3000.0f
+#define OCCLUSION_UPDATE_RATE 0.05f
 
 enum atmokySpatializerParameterIndex {
   ATMOKY_PARAMETER_MIN_DISTANCE,       // float
@@ -120,6 +124,16 @@ static unsigned int atmoky_externalizer_handle = 0;
 static FMOD_DSP *atmoky_master_externalizer = NULL;
 static FMOD_3D_ATTRIBUTES listener_atmoky;
 static FMOD_VECTOR listener_atmoky_right;
+static const vec3_t ear_offsets[OCCLUSION_RAY_COUNT] = {
+    {0.0f, 0.0f, 0.0f},
+    {4.0f, 0.0f, 0.0f},
+    {-4.0f, 0.0f, 0.0f},
+    {0.0f, 4.0f, 0.0f},
+    {0.0f, -4.0f, 0.0f},
+    {3.0f, 3.0f, 0.0f},
+    {-3.0f, 3.0f, 0.0f},
+    {3.0f, -3.0f, 0.0f}
+};
 
 typedef struct {
   FMOD_SOUND *sound;
@@ -144,6 +158,8 @@ typedef struct {
   vec3_t prev_origin_qu;
   vec3_t origin_offset;
   qbool have_prev_origin;
+  float current_occlusion;
+  double last_occlusion_time;
 } fmod_channel_t;
 static fmod_channel_t fmod_channels[MAX_FMOD_CHANNELS];
 static FMOD_CHANNEL *ambient_fmod_channels[NUM_AMBIENTS];
@@ -357,6 +373,95 @@ static void ComputeRelative3DAttributes(const FMOD_VECTOR *abs_pos,
   out_relative->up.x = 0.0f;
   out_relative->up.y = 1.0f;
   out_relative->up.z = 0.0f;
+}
+
+static int S_FindContainingBSPPhysent(const vec3_t p)
+{
+    for (int i = 0; i < pmove.numphysent; i++) {
+        physent_t *pe = &pmove.physents[i];
+        if (!pe->model) continue;              // BSP models only
+        hull_t *h = &pe->model->hulls[0];      // point hull
+        vec3_t pl;
+        VectorSubtract(p, pe->origin, pl);     // model-local
+        if (CM_HullPointContents(h, h->firstclipnode, pl) == CONTENTS_SOLID)
+            return i;
+    }
+    return -1;
+}
+
+static trace_t S_TraceLine_BSPOnly(vec3_t start, vec3_t end, int skip1, int skip2)
+{
+    trace_t trace, total;
+    vec3_t offset, start_l, end_l;
+    hull_t *hull;
+    int i;
+    physent_t *pe;
+    memset(&total, 0, sizeof(total));
+    total.fraction = 1.0f;
+    total.e.entnum = -1;
+    VectorCopy(end, total.endpos);
+    for (i = 0; i < pmove.numphysent; i++)
+    {
+        pe = &pmove.physents[i];
+        if (!pe->model)
+            continue;
+            if (i == skip1 || i == skip2) continue;
+        hull = &pe->model->hulls[0];
+        VectorCopy(pe->origin, offset);
+        VectorSubtract(start, offset, start_l);
+        VectorSubtract(end,   offset, end_l);
+        trace = CM_HullTrace(hull, start_l, end_l);
+        VectorAdd(trace.endpos, offset, trace.endpos);
+        if (trace.allsolid)
+            trace.startsolid = true;
+        if (trace.startsolid)
+            trace.fraction = 0;
+        if (trace.fraction < total.fraction)
+        {
+            total = trace;
+            total.e.entnum = i;
+        }
+    }
+    return total;
+}
+
+static float CalcOcclusionFactor(const vec3_t listener_pos, const vec3_t source_pos)
+{
+    int skip_src = S_FindContainingBSPPhysent(source_pos);
+    int skip_lst = S_FindContainingBSPPhysent(listener_pos);
+    int blocked = 0;
+float occlusion = 0.0f;
+
+    for (int i = 0; i < OCCLUSION_RAY_COUNT; i++) {
+        vec3_t rotated_offset, target_pos;
+        const vec3_t *offset = &ear_offsets[i];
+        rotated_offset[0] = listener_right[0] * (*offset)[0] + listener_up[0] * (*offset)[1] + listener_forward[0] * (*offset)[2];
+        rotated_offset[1] = listener_right[1] * (*offset)[0] + listener_up[1] * (*offset)[1] + listener_forward[1] * (*offset)[2];
+        rotated_offset[2] = listener_right[2] * (*offset)[0] + listener_up[2] * (*offset)[1] + listener_forward[2] * (*offset)[2];
+        VectorAdd(listener_pos, rotated_offset, target_pos);
+        trace_t ear_tr = S_TraceLine_BSPOnly(listener_pos, target_pos, skip_lst, -1);
+        if (ear_tr.fraction < 1.0f) {
+            vec3_t dir;
+            VectorSubtract(target_pos, listener_pos, dir);
+            VectorScale(dir, ear_tr.fraction * 0.9f, dir);   // stay a bit on the open side
+            VectorAdd(listener_pos, dir, target_pos);
+        }
+        trace_t tr = S_TraceLine_BSPOnly(source_pos, target_pos, skip_src, skip_lst);
+        if (tr.fraction < 1.0f)
+            blocked++;
+    }
+    occlusion = (float)blocked / (float)OCCLUSION_RAY_COUNT;
+    vec3_t d;
+    float dist, w;
+    const float near = 96.0f;
+    const float far  = 256.0f;
+    VectorSubtract(listener_pos, source_pos, d);
+    dist = sqrtf(DotProduct(d, d));
+    if (dist <= near) w = 0.0f;
+    else if (dist >= far) w = 1.0f;
+    else w = (dist - near) / (far - near);
+    occlusion *= w;
+    return occlusion;
 }
 
 static void Atmoky_LoadPlugin(void) {
@@ -626,6 +731,12 @@ static void Atmoky_UpdateSpatializers(void) {
     VectorCopy(cur_origin, fch->origin_qu);
     VectorCopy(cur_origin, fch->prev_origin_qu);
     fch->have_prev_origin = true;
+    if (cls.realtime - fch->last_occlusion_time > OCCLUSION_UPDATE_RATE) {
+    fch->current_occlusion = CalcOcclusionFactor(listener_origin, cur_origin);
+    result = FMOD_DSP_SetParameterFloat(fch->spatializer, ATMOKY_PARAMETER_OCCLUSION, fch->current_occlusion);
+    FMOD_ERRLOG(result, "Atmoky dynamic occlusion");
+    fch->last_occlusion_time = cls.realtime;
+    }
     FMOD_DSP_PARAMETER_3DATTRIBUTES a;
     memset(&a, 0, sizeof(a));
     a.absolute.position = QToAtmokyPosMeters(cur_origin);
