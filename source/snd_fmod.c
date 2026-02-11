@@ -19,10 +19,12 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "quakedef.h"
 #include "sound.h"
-#include "pmove.h"
 #include <fmod.h>
 #include <fmod_dsp.h>
 #include <fmod_errors.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <threads.h>
 
 #define FMOD_ERRCHECK(result, ctx)                                             \
   do {                                                                         \
@@ -125,21 +127,23 @@ static FMOD_DSP *atmoky_master_externalizer = NULL;
 static FMOD_3D_ATTRIBUTES listener_atmoky;
 static FMOD_VECTOR listener_atmoky_right;
 static const vec3_t ear_offsets[OCCLUSION_RAY_COUNT] = {
-    {0.0f, 0.0f, 0.0f},
-    {4.0f, 0.0f, 0.0f},
-    {-4.0f, 0.0f, 0.0f},
-    {0.0f, 4.0f, 0.0f},
-    {0.0f, -4.0f, 0.0f},
-    {3.0f, 3.0f, 0.0f},
-    {-3.0f, 3.0f, 0.0f},
-    {3.0f, -3.0f, 0.0f}
-};
+    {0.0f, 0.0f, 0.0f},  {4.0f, 0.0f, 0.0f},  {-4.0f, 0.0f, 0.0f},
+    {0.0f, 4.0f, 0.0f},  {0.0f, -4.0f, 0.0f}, {3.0f, 3.0f, 0.0f},
+    {-3.0f, 3.0f, 0.0f}, {3.0f, -3.0f, 0.0f}};
+static mtx_t fs_open_lock;
 
 typedef struct {
   FMOD_SOUND *sound;
   qbool loaded;
   qbool want_precache;
 } fmod_sfx_t;
+
+typedef struct {
+  FILE *fp;
+  long base;
+  unsigned int size;
+  mtx_t lock;
+} FmodFsHandle;
 
 static sfx_t *known_sfx = NULL;
 static fmod_sfx_t *fmod_sounds = NULL;
@@ -373,95 +377,6 @@ static void ComputeRelative3DAttributes(const FMOD_VECTOR *abs_pos,
   out_relative->up.x = 0.0f;
   out_relative->up.y = 1.0f;
   out_relative->up.z = 0.0f;
-}
-
-static int S_FindContainingBSPPhysent(const vec3_t p)
-{
-    for (int i = 0; i < pmove.numphysent; i++) {
-        physent_t *pe = &pmove.physents[i];
-        if (!pe->model) continue;              // BSP models only
-        hull_t *h = &pe->model->hulls[0];      // point hull
-        vec3_t pl;
-        VectorSubtract(p, pe->origin, pl);     // model-local
-        if (CM_HullPointContents(h, h->firstclipnode, pl) == CONTENTS_SOLID)
-            return i;
-    }
-    return -1;
-}
-
-static trace_t S_TraceLine_BSPOnly(vec3_t start, vec3_t end, int skip1, int skip2)
-{
-    trace_t trace, total;
-    vec3_t offset, start_l, end_l;
-    hull_t *hull;
-    int i;
-    physent_t *pe;
-    memset(&total, 0, sizeof(total));
-    total.fraction = 1.0f;
-    total.e.entnum = -1;
-    VectorCopy(end, total.endpos);
-    for (i = 0; i < pmove.numphysent; i++)
-    {
-        pe = &pmove.physents[i];
-        if (!pe->model)
-            continue;
-            if (i == skip1 || i == skip2) continue;
-        hull = &pe->model->hulls[0];
-        VectorCopy(pe->origin, offset);
-        VectorSubtract(start, offset, start_l);
-        VectorSubtract(end,   offset, end_l);
-        trace = CM_HullTrace(hull, start_l, end_l);
-        VectorAdd(trace.endpos, offset, trace.endpos);
-        if (trace.allsolid)
-            trace.startsolid = true;
-        if (trace.startsolid)
-            trace.fraction = 0;
-        if (trace.fraction < total.fraction)
-        {
-            total = trace;
-            total.e.entnum = i;
-        }
-    }
-    return total;
-}
-
-static float CalcOcclusionFactor(const vec3_t listener_pos, const vec3_t source_pos)
-{
-    int skip_src = S_FindContainingBSPPhysent(source_pos);
-    int skip_lst = S_FindContainingBSPPhysent(listener_pos);
-    int blocked = 0;
-float occlusion = 0.0f;
-
-    for (int i = 0; i < OCCLUSION_RAY_COUNT; i++) {
-        vec3_t rotated_offset, target_pos;
-        const vec3_t *offset = &ear_offsets[i];
-        rotated_offset[0] = listener_right[0] * (*offset)[0] + listener_up[0] * (*offset)[1] + listener_forward[0] * (*offset)[2];
-        rotated_offset[1] = listener_right[1] * (*offset)[0] + listener_up[1] * (*offset)[1] + listener_forward[1] * (*offset)[2];
-        rotated_offset[2] = listener_right[2] * (*offset)[0] + listener_up[2] * (*offset)[1] + listener_forward[2] * (*offset)[2];
-        VectorAdd(listener_pos, rotated_offset, target_pos);
-        trace_t ear_tr = S_TraceLine_BSPOnly(listener_pos, target_pos, skip_lst, -1);
-        if (ear_tr.fraction < 1.0f) {
-            vec3_t dir;
-            VectorSubtract(target_pos, listener_pos, dir);
-            VectorScale(dir, ear_tr.fraction * 0.9f, dir);   // stay a bit on the open side
-            VectorAdd(listener_pos, dir, target_pos);
-        }
-        trace_t tr = S_TraceLine_BSPOnly(source_pos, target_pos, skip_src, skip_lst);
-        if (tr.fraction < 1.0f)
-            blocked++;
-    }
-    occlusion = (float)blocked / (float)OCCLUSION_RAY_COUNT;
-    vec3_t d;
-    float dist, w;
-    const float near = 96.0f;
-    const float far  = 256.0f;
-    VectorSubtract(listener_pos, source_pos, d);
-    dist = sqrtf(DotProduct(d, d));
-    if (dist <= near) w = 0.0f;
-    else if (dist >= far) w = 1.0f;
-    else w = (dist - near) / (far - near);
-    occlusion *= w;
-    return occlusion;
 }
 
 static void Atmoky_LoadPlugin(void) {
@@ -731,12 +646,6 @@ static void Atmoky_UpdateSpatializers(void) {
     VectorCopy(cur_origin, fch->origin_qu);
     VectorCopy(cur_origin, fch->prev_origin_qu);
     fch->have_prev_origin = true;
-    if (cls.realtime - fch->last_occlusion_time > OCCLUSION_UPDATE_RATE) {
-    fch->current_occlusion = CalcOcclusionFactor(listener_origin, cur_origin);
-    result = FMOD_DSP_SetParameterFloat(fch->spatializer, ATMOKY_PARAMETER_OCCLUSION, fch->current_occlusion);
-    FMOD_ERRLOG(result, "Atmoky dynamic occlusion");
-    fch->last_occlusion_time = cls.realtime;
-    }
     FMOD_DSP_PARAMETER_3DATTRIBUTES a;
     memset(&a, 0, sizeof(a));
     a.absolute.position = QToAtmokyPosMeters(cur_origin);
@@ -865,9 +774,6 @@ sfx_t *S_FindName(char *name) {
 static FMOD_SOUND *FMOD_LoadSfx(sfx_t *sfx) {
   int idx;
   char namebuf[256];
-  byte stackbuf[4 * 1024];
-  byte *data;
-  FMOD_CREATESOUNDEXINFO exinfo;
   FMOD_RESULT result;
   if (!fmod_system || !sfx)
     return NULL;
@@ -877,21 +783,11 @@ static FMOD_SOUND *FMOD_LoadSfx(sfx_t *sfx) {
   if (fmod_sounds[idx].loaded)
     return fmod_sounds[idx].sound;
   snprintf(namebuf, sizeof(namebuf), "sound/%s", sfx->name);
-  data = FS_LoadStackFile(namebuf, stackbuf, sizeof(stackbuf));
-  if (!data) {
-    Com_Printf("FMOD: couldn't load %s\n", namebuf);
-    fmod_sounds[idx].loaded = true; // don't retry
-    fmod_sounds[idx].sound = NULL;
-    return NULL;
-  }
-  memset(&exinfo, 0, sizeof(exinfo));
-  exinfo.cbsize = sizeof(exinfo);
-  exinfo.length = fs_filesize;
   FMOD_MODE mode;
-  mode = FMOD_OPENMEMORY | FMOD_LOOP_OFF | FMOD_CREATESAMPLE;
+  mode = FMOD_LOOP_OFF | FMOD_CREATESAMPLE;
   mode |= (atmoky_available ? FMOD_2D : (FMOD_3D | FMOD_3D_LINEARROLLOFF));
-  result = FMOD_System_CreateSound(fmod_system, (const char *)data, mode,
-                                   &exinfo, &fmod_sounds[idx].sound);
+  result = FMOD_System_CreateSound(fmod_system, namebuf, mode, NULL,
+                                   &fmod_sounds[idx].sound);
   if (result != FMOD_OK) {
     Com_Printf("FMOD ERROR [CreateSound '%s']: %s (%d)\n", sfx->name,
                FMOD_ErrorString(result), (int)result);
@@ -998,16 +894,18 @@ static fmod_channel_t *AllocChannel(void) {
       return &fmod_channels[i];
     }
   }
+  /*
   for (i = 0; i < MAX_FMOD_CHANNELS; i++) {
     if (!fmod_channels[i].channel)
       continue;
-    if (!ChannelIsVirtual(fmod_channels[i].channel))
+    if (ChannelIsVirtual(fmod_channels[i].channel))
       continue;
     FMOD_Channel_Stop(fmod_channels[i].channel);
     Atmoky_ReleaseSpatializer(&fmod_channels[i]);
     memset(&fmod_channels[i], 0, sizeof(fmod_channels[i]));
     return &fmod_channels[i];
   }
+  */
   return NULL;
 }
 
@@ -1105,12 +1003,95 @@ static void S_UpdateAmbientSounds(void) {
   }
 }
 
+// FMOD file system routines
+static FMOD_RESULT S_FMOD_FileOpenCallback(const char *name,
+                                           unsigned int *filesize,
+                                           void **handle, void *userdata) {
+  (void)userdata;
+  if (!name || !filesize || !handle)
+    return FMOD_ERR_INVALID_PARAM;
+  if (mtx_lock(&fs_open_lock) != thrd_success)
+    return FMOD_ERR_INTERNAL;
+  FILE *fp = NULL;
+  int sz = FS_FOpenFile((char *)name, &fp);
+  if (mtx_unlock(&fs_open_lock) != thrd_success)
+    return FMOD_ERR_INTERNAL;
+  if (!fp || sz < 0)
+    return FMOD_ERR_FILE_NOTFOUND;
+  long base = ftell(fp);
+  if (base < 0)
+    base = 0;
+  FmodFsHandle *h = Q_malloc(sizeof(*h));
+  if (!h) {
+    fclose(fp);
+    return FMOD_ERR_MEMORY;
+  }
+  h->fp = fp;
+  h->base = base;
+  h->size = (unsigned int)sz;
+  if (mtx_init(&h->lock, mtx_plain) != thrd_success) {
+    fclose(fp);
+    Q_free(h);
+    return FMOD_ERR_INTERNAL;
+  }
+  (void)fseek(h->fp, h->base, SEEK_SET);
+  *filesize = h->size;
+  *handle = h;
+  return FMOD_OK;
+}
+
+static FMOD_RESULT S_FMOD_FileReadCallback(void *handle, void *buffer,
+                                           unsigned int sizebytes,
+                                           unsigned int *bytesread,
+                                           void *userdata) {
+  (void)userdata;
+  if (!handle || !buffer || !bytesread)
+    return FMOD_ERR_INVALID_PARAM;
+  FmodFsHandle *h = (FmodFsHandle *)handle;
+  if (mtx_lock(&h->lock) != thrd_success)
+    return FMOD_ERR_INTERNAL;
+  size_t r = fread(buffer, 1, sizebytes, h->fp);
+  if (mtx_unlock(&h->lock) != thrd_success)
+    return FMOD_ERR_INTERNAL;
+  *bytesread = (unsigned int)r;
+  return (r < sizebytes) ? FMOD_ERR_FILE_EOF : FMOD_OK;
+}
+
+static FMOD_RESULT S_FMOD_FileSeekCallback(void *handle, unsigned int pos,
+                                           void *userdata) {
+  (void)userdata;
+  if (!handle)
+    return FMOD_ERR_INVALID_HANDLE;
+  FmodFsHandle *h = (FmodFsHandle *)handle;
+  if (mtx_lock(&h->lock) != thrd_success)
+    return FMOD_ERR_INTERNAL;
+  int rc = fseek(h->fp, h->base + (long)pos, SEEK_SET);
+  if (mtx_unlock(&h->lock) != thrd_success)
+    return FMOD_ERR_INTERNAL;
+  return (rc == 0) ? FMOD_OK : FMOD_ERR_FILE_COULDNOTSEEK;
+}
+
+static FMOD_RESULT S_FMOD_FileCloseCallback(void *handle, void *userdata) {
+  (void)userdata;
+  if (!handle)
+    return FMOD_ERR_INVALID_HANDLE;
+  FmodFsHandle *h = (FmodFsHandle *)handle;
+  if (mtx_lock(&h->lock) != thrd_success)
+    return FMOD_ERR_INTERNAL;
+  int rc = fclose(h->fp);
+  mtx_unlock(&h->lock);
+  mtx_destroy(&h->lock);
+  Q_free(h);
+  return (rc == 0) ? FMOD_OK : FMOD_ERR_FILE_BAD;
+}
+
 /*
 ================
 S_Init
 ================
 */
 void S_Init(void) {
+  mtx_init(&fs_open_lock, mtx_plain);
   FMOD_RESULT result;
   if (!snd_commands_initialized) {
     snd_commands_initialized = true;
@@ -1172,9 +1153,15 @@ void S_Init(void) {
     desired_output = FMOD_OUTPUTTYPE_AUTODETECT;
   }
   Atmoky_LoadPlugin(); /* sets atmoky_available true/false */
-  result =
-      FMOD_System_Init(fmod_system, MAX_FMOD_CHANNELS,
-                       atmoky_available ? 0 : FMOD_INIT_3D_RIGHTHANDED, NULL);
+  result = FMOD_System_Init(
+      fmod_system, MAX_FMOD_CHANNELS,
+      atmoky_available
+          ? (FMOD_INIT_CLIP_OUTPUT | FMOD_INIT_CHANNEL_LOWPASS |
+             FMOD_INIT_CHANNEL_DISTANCEFILTER | FMOD_INIT_VOL0_BECOMES_VIRTUAL)
+          : (FMOD_INIT_3D_RIGHTHANDED | FMOD_INIT_CLIP_OUTPUT |
+             FMOD_INIT_CHANNEL_LOWPASS | FMOD_INIT_CHANNEL_DISTANCEFILTER |
+             FMOD_INIT_VOL0_BECOMES_VIRTUAL),
+      NULL);
   if (result != FMOD_OK) {
     Com_Printf("FMOD ERROR [System_Init]: %s (%d)\n", FMOD_ErrorString(result),
                (int)result);
@@ -1200,6 +1187,10 @@ void S_Init(void) {
     max_sfx = SFX_INITIAL;
     num_sfx = 0;
   }
+  result = FMOD_System_SetFileSystem(
+      fmod_system, S_FMOD_FileOpenCallback, S_FMOD_FileCloseCallback,
+      S_FMOD_FileReadCallback, S_FMOD_FileSeekCallback, NULL, NULL, -1);
+  FMOD_ERRLOG(result, "Set File System");
   fmod_initialized = true;
   snd_initialized = true;
   FMOD_ProcessQueuedPrecaches();
@@ -1278,6 +1269,7 @@ void S_Shutdown(void) {
   num_sfx = 0;
   fmod_initialized = false;
   snd_initialized = false;
+  mtx_destroy(&fs_open_lock);
   Com_Printf("FMOD sound system shut down\n");
 }
 
